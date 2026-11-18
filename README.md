@@ -2,9 +2,9 @@
 
 > Global Solution FIAP 2026 (CitizenTech) · Edge Computing & Computer Systems
 
-**Simulação no Wokwi:** `[COLE AQUI O LINK PÚBLICO DO PROJETO]`
-**Vídeo de apresentação:** `[COLE AQUI O LINK DO VÍDEO]`
-**Integrantes:** `[NOMES E RMs]`
+**Simulação no Wokwi:** `https://wokwi.com/projects/480863107384025089`
+**Vídeo de apresentação:** ``
+**Integrantes:** `Gustavo Bidin Marto 570272, Isadora Bradac 569585, Mateus Borges 571424, Artur de Sá 569526, Matheus Piorunneck 569454 `
 
 ---
 
