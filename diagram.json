@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "author": "IntegraMed - FIAP GS 2026",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+
+    { "type": "wokwi-dht22", "id": "dht1", "top": -105, "left": -170, "attrs": {} },
+    { "type": "wokwi-photoresistor-sensor", "id": "ldr1", "top": 60, "left": -250, "attrs": {} },
+
+    { "type": "wokwi-pushbutton", "id": "btn_ok", "top": 230, "left": -140,
+      "attrs": { "color": "green", "label": "Tomei" } },
+    { "type": "wokwi-pushbutton", "id": "btn_teste", "top": 230, "left": -50,
+      "attrs": { "color": "blue", "label": "Teste" } },
+
+    { "type": "wokwi-led", "id": "led_g", "top": -100, "left": 260, "attrs": { "color": "green", "label": "Seguro" } },
+    { "type": "wokwi-led", "id": "led_y", "top": -100, "left": 320, "attrs": { "color": "yellow", "label": "Alerta" } },
+    { "type": "wokwi-led", "id": "led_r", "top": -100, "left": 380, "attrs": { "color": "red", "label": "Critico" } },
+    { "type": "wokwi-resistor", "id": "r_g", "top": -20, "left": 250, "rotate": 90, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "r_y", "top": -20, "left": 310, "rotate": 90, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "r_r", "top": -20, "left": 370, "rotate": 90, "attrs": { "value": "220" } },
+
+    { "type": "wokwi-buzzer", "id": "buz1", "top": 150, "left": 300, "attrs": { "volume": "0.1" } },
+
+    { "type": "wokwi-lcd1602", "id": "lcd1", "top": 260, "left": 90, "attrs": { "pins": "i2c" } }
+  ],
+  "connections": [
+    [ "esp:TX0", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX0", "$serialMonitor:TX", "", [] ],
+
+    [ "dht1:VCC", "esp:3V3", "red", [ "v0" ] ],
+    [ "dht1:SDA", "esp:D15", "green", [ "v0" ] ],
+    [ "dht1:GND", "esp:GND.1", "black", [ "v0" ] ],
+
+    [ "ldr1:VCC", "esp:3V3", "red", [ "v0" ] ],
+    [ "ldr1:GND", "esp:GND.1", "black", [ "v0" ] ],
+    [ "ldr1:AO", "esp:D34", "orange", [ "v0" ] ],
+
+    [ "btn_ok:1.l", "esp:D4", "green", [ "v0" ] ],
+    [ "btn_ok:2.l", "esp:GND.1", "black", [ "v0" ] ],
+    [ "btn_teste:1.l", "esp:D5", "blue", [ "v0" ] ],
+    [ "btn_teste:2.l", "esp:GND.1", "black", [ "v0" ] ],
+
+    [ "esp:D12", "r_g:1", "green", [ "v0" ] ],
+    [ "r_g:2", "led_g:A", "green", [ "v0" ] ],
+    [ "led_g:C", "esp:GND.2", "black", [ "v0" ] ],
+
+    [ "esp:D14", "r_y:1", "gold", [ "v0" ] ],
+    [ "r_y:2", "led_y:A", "gold", [ "v0" ] ],
+    [ "led_y:C", "esp:GND.2", "black", [ "v0" ] ],
+
+    [ "esp:D27", "r_r:1", "red", [ "v0" ] ],
+    [ "r_r:2", "led_r:A", "red", [ "v0" ] ],
+    [ "led_r:C", "esp:GND.2", "black", [ "v0" ] ],
+
+    [ "buz1:1", "esp:GND.2", "black", [ "v0" ] ],
+    [ "buz1:2", "esp:D26", "purple", [ "v0" ] ],
+
+    [ "lcd1:GND", "esp:GND.2", "black", [ "v0" ] ],
+    [ "lcd1:VCC", "esp:VIN", "red", [ "v0" ] ],
+    [ "lcd1:SDA", "esp:D21", "cyan", [ "v0" ] ],
+    [ "lcd1:SCL", "esp:D22", "yellow", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}
