@@ -1,29 +1,14 @@
 /*
- * ============================================================================
- *  IntegraMed - Porta-Remedios Inteligente (Edge Computing + MQTT)
- *  Plataforma: ESP32 (Wokwi) | Linguagem: C++ (Arduino)
- *  Global Solution FIAP 2026 - CitizenTech
- * ----------------------------------------------------------------------------
- *  ARQUITETURA (2 nucleos):
- *     Nucleo 1 (loop)        : BORDA - sensores, decisao, LEDs, buzzer, LCD.
- *                              Usa apenas millis(); nunca espera pela rede.
- *     Nucleo 0 (tarefaRede)  : Wi-Fi + MQTT. Se a rede cair ou o broker
- *                              demorar, a borda continua funcionando.
- *     Comunicacao entre os dois: fila de comandos (rede -> borda) e
- *                              buffer JSON protegido por mutex (borda -> rede).
- *
- *  CICLO DE BORDA:
- *     medir -> filtrar (media movel) -> processar (indice, tendencia,
- *     histerese) -> decidir estado -> atuar -> publicar
- *
- *  Pinagem:
- *     DHT22 GPIO15 | LDR (AO) GPIO34 | Botao verde GPIO4 | Botao azul GPIO5
- *     LED verde GPIO12 | amarelo GPIO14 | vermelho GPIO27 | Buzzer GPIO26
- *     LCD I2C (0x27): SDA GPIO21 / SCL GPIO22
- *
- *  IMPORTANTE: o LDR e calibrado no boot. Inicie a simulacao com a tampa
- *  FECHADA (slider de luz do LDR no valor "escuro/normal").
- * ============================================================================
+- ============================================================================
+-  IntegraMed v2.1 - Porta-Remedios Inteligente (Edge Computing + MQTT)
+-  Plataforma: ESP32 (Wokwi) | Linguagem: C++ (Arduino)
+-  Global Solution FIAP 2026 - CitizenTech
+- ----------------------------------------------------------------------------
+-  Pinagem:
+-     DHT22 GPIO15 | LDR (AO) GPIO34 | Botao verde GPIO4 | Botao azul GPIO5
+-     LED verde GPIO12 | amarelo GPIO14 | vermelho GPIO27 | Buzzer GPIO26
+-     LCD I2C (0x27): SDA GPIO21 / SCL GPIO22
+- ============================================================================
  */
 
 #include <Arduino.h>
@@ -32,10 +17,6 @@
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/queue.h>
-#include <freertos/semphr.h>
 
 // ============================================================================
 // 1. CONFIGURACOES
@@ -58,23 +39,23 @@ const char* TOPICO_SUB    = "fiap/gs2026/integramed/033/comandos";
 const char* TOPICO_STATUS = "fiap/gs2026/integramed/033/status";   // Last Will
 const char* DEVICE_ID     = "integramed-033";
 
-// --- Limiares com histerese (entra no limite, sai abaixo do limite de saida) ---
+// --- Limiares com histerese ---
 const float TEMP_ALERTA_IN   = 25.0, TEMP_ALERTA_OUT   = 24.0;
 const float TEMP_CRITICA_IN  = 30.0, TEMP_CRITICA_OUT  = 29.0;
 const float UMID_ALERTA_IN   = 70.0, UMID_ALERTA_OUT   = 68.0;
 
-// --- Tendencia: subida de >= 1.0 C em 30 s (15 amostras de 2 s) ja avisa ---
+// --- Tendencia: subida de >= 1.0 C em 30 s (15 amostras de 2 s) ---
 #define JANELA_TENDENCIA 15
 const float TENDENCIA_LIMITE   = 1.0;
-const float TENDENCIA_TEMP_MIN = 22.0;   // so avisa se ja estiver perto do limite
+const float TENDENCIA_TEMP_MIN = 22.0;
 
 // --- Atraso e luz ---
 const unsigned long ATRASO_CRITICO_MS = 15000UL;   // 15 s sem tomar -> vermelho
 const unsigned long LUZ_MAX_SEG       = 10;        // tampa aberta > 10 s -> amarelo
 
-// --- LDR: calibrado no boot. Tampa "aberta" = leitura se afasta da base ---
-const int LDR_DELTA_ABRIR  = 500;   // diferenca (ADC 0..4095) para considerar ABERTA
-const int LDR_DELTA_FECHAR = 300;   // diferenca para voltar a FECHADA (histerese)
+// --- LDR (ADC 0..4095) ---
+#define LDR_ALTO_E_LUZ 1
+const int LDR_LIMIAR = 2000;
 
 // --- Filtro e limites fisicos do DHT22 ---
 #define JANELA 5
@@ -87,35 +68,13 @@ const unsigned long PERIODO_DHT_MS      = 2000;
 const unsigned long PERIODO_LCD_MS      = 500;
 const unsigned long PERIODO_MQTT_MS     = 3000;
 const unsigned long PERIODO_RECONECT_MS = 5000;
-const unsigned long DEBOUNCE_MS         = 40;
+const unsigned long DEBOUNCE_ISR_MS     = 180;     // Debounce na interrupcao
 
 // --- Buzzer ---
-const int FREQ_LEMBRETE = 1500, FREQ_CRITICA = 2500;
+const int FREQ_LEMBRETE = 1500, FREQ_CRITICA = 2500, FREQ_ACK = 1800;
 const unsigned long BIP_ON_MS = 150, BIP_PERIODO_MS = 1500;
 
-// --- LCD: a linha 2 alterna entre o status e o nome do remedio ---
-const unsigned long LCD_FASE_STATUS_MS = 3000;
-const unsigned long LCD_FASE_NOME_MS   = 3000;
-
-// --- Fila de comandos MQTT (rede -> borda) ---
-#define TAM_COMANDO 96
-#define TAM_JSON    520
-
 enum EstadoBorda { ESTADO_VERDE, ESTADO_AMARELO, ESTADO_VERMELHO };
-enum AlarmeTipo  { ALARME_OFF, ALARME_LEMBRETE, ALARME_TERMICO, ALARME_LUZ,
-                   ALARME_TENDENCIA, ALARME_CRITICO, ALARME_TERMICO_CRITICO };
-
-const char* nomeAlarme(AlarmeTipo a) {
-  switch (a) {
-    case ALARME_LEMBRETE:        return "LEMBRETE";
-    case ALARME_TERMICO:         return "TERMICO";
-    case ALARME_LUZ:             return "LUZ";
-    case ALARME_TENDENCIA:       return "TENDENCIA";
-    case ALARME_CRITICO:         return "CRITICO";
-    case ALARME_TERMICO_CRITICO: return "TERMICO_CRITICO";
-    default:                     return "OFF";
-  }
-}
 
 // ============================================================================
 // 2. OBJETOS E VARIAVEIS GLOBAIS
@@ -124,13 +83,6 @@ DHT dht(PIN_DHT, DHT22);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
-
-// --- Sincronizacao entre os nucleos ---
-QueueHandle_t     filaComandos = NULL;     // comandos recebidos pelo MQTT
-SemaphoreHandle_t mutexJson    = NULL;     // protege o buffer de telemetria
-char jsonPendente[TAM_JSON];               // ultimo JSON montado pela borda
-volatile bool jsonNovo = false;            // ha JSON aguardando publicacao
-volatile bool mqttReconectou = false;      // aviso da rede para a borda
 
 // --- Media movel de 5 amostras ---
 struct MediaMovel {
@@ -148,13 +100,13 @@ float temperatura = NAN, umidade = NAN;
 bool sensorOk = false;
 uint8_t falhasDht = 0;
 
-// --- Historico para tendencia (temperaturas ja filtradas) ---
+// --- Historico para tendencia ---
 float histTemp[JANELA_TENDENCIA];
 uint8_t histIdx = 0, histN = 0;
-float tendencia = 0.0;   // variacao em ~30 s (graus C)
+float tendencia = 0.0;
 
 // --- Relogio interno (segundos absolutos) ---
-uint32_t relogioAbs = 7UL * 3600 + 59UL * 60 + 45;   // inicia 07:59:45 (demo)
+uint32_t relogioAbs = 7UL * 3600 + 59UL * 60 + 45;   // inicia 07:59:45
 unsigned long ultimoTick = 0;
 uint32_t diaAtual = 0;
 
@@ -167,95 +119,62 @@ unsigned long inicioAlarmeMs = 0;
 uint16_t dosesHoje = 0;
 
 // --- Tampa / luz ---
-int  ldrBase = 0;               // leitura de referencia (tampa fechada)
 bool tampaAberta = false;
 unsigned long tAberturaMs = 0;
 
 // --- Estado, histerese e atuadores ---
 EstadoBorda estado = ESTADO_VERDE;
-AlarmeTipo  alarme = ALARME_OFF;
+const char* statusAlarme = "OFF";
 bool latchAlerta = false, latchCritico = false;
 int indiceConservacao = 100;
 int freqAtual = 0;
 
-// --- Botoes ---
-struct Botao { uint8_t pino; bool ultimaLeitura; bool estavel; unsigned long tMudanca; };
-Botao btnTomei = {PIN_BTN_TOMEI, HIGH, HIGH, 0};
-Botao btnTeste = {PIN_BTN_TESTE, HIGH, HIGH, 0};
+// --- Feedback instantaneo (LCD + Buzzer) ---
+char avisoL1[17] = "";
+char avisoL2[17] = "";
+unsigned long fimAvisoLcdMs = 0;
+unsigned long fimBipAckMs   = 0;
 
-// --- Temporizadores ---
-unsigned long tDht = 0, tLcd = 0, tMqtt = 0;
-bool forcarPublicacao = false;
+// --- Botoes via Interrupcao de Hardware (resposta instantanea) ---
+struct BotaoISR {
+  uint8_t pino;
+  volatile bool pendente;
+  volatile unsigned long ultimoAcionamentoMs;
+};
+BotaoISR btnTomei = {PIN_BTN_TOMEI, false, 0};
+BotaoISR btnTeste = {PIN_BTN_TESTE, false, 0};
 
-// --- LCD (alternancia status/nome) ---
-bool lcdMostrarNome = false;
-unsigned long lcdTFase = 0;
-uint8_t lcdScrollTick = 0;
-
-// ============================================================================
-// 3. TEMPO E AGENDA
-// ============================================================================
-void fmtHMS(uint32_t abs, char* out) {   // out >= 9 bytes
-  unsigned long s = abs % 86400UL;
-  snprintf(out, 9, "%02lu:%02lu:%02lu", s / 3600, (s % 3600) / 60, s % 60);
-}
-void fmtHM(uint32_t abs, char* out) {    // out >= 6 bytes
-  unsigned long s = abs % 86400UL;
-  snprintf(out, 6, "%02lu:%02lu", s / 3600, (s % 3600) / 60);
-}
-
-// Agenda a proxima dose para HH:MM (hoje, ou amanha se o horario ja passou)
-void agendarPara(int hh, int mm) {
-  uint32_t base = (relogioAbs / 86400UL) * 86400UL + hh * 3600UL + mm * 60UL;
-  if (base <= relogioAbs) base += 86400UL;
-  proximaDoseAbs = base;
-  doseDevida = false;
-}
-
-// Relogio nao-bloqueante: 1 tick por segundo real
-void atualizarRelogio() {
+void IRAM_ATTR isrBtnTomei() {
   unsigned long agora = millis();
-  while (agora - ultimoTick >= 1000UL) {
-    ultimoTick += 1000UL;
-    relogioAbs++;
-    if (relogioAbs / 86400UL != diaAtual) { diaAtual = relogioAbs / 86400UL; dosesHoje = 0; }
+  if (agora - btnTomei.ultimoAcionamentoMs >= DEBOUNCE_ISR_MS) {
+    btnTomei.pendente = true;
+    btnTomei.ultimoAcionamentoMs = agora;
   }
 }
 
-// Confirma a dose SOMENTE se houver dose pendente (evita pular a agenda
-// por um aperto acidental). Soma a posologia para agendar a proxima.
-bool confirmarDose(const char* origem) {
-  if (!doseDevida) {
-    Serial.printf("[DOSE] ignorada (%s): nenhuma dose pendente\n", origem);
-    return false;
+void IRAM_ATTR isrBtnTeste() {
+  unsigned long agora = millis();
+  if (agora - btnTeste.ultimoAcionamentoMs >= DEBOUNCE_ISR_MS) {
+    btnTeste.pendente = true;
+    btnTeste.ultimoAcionamentoMs = agora;
   }
-  dosesHoje++;
-  proximaDoseAbs += (uint32_t)intervaloHoras * 3600UL;
-  while (proximaDoseAbs <= relogioAbs) proximaDoseAbs += (uint32_t)intervaloHoras * 3600UL;
-  doseDevida = false;
-  forcarPublicacao = true;
-  char hm[6]; fmtHM(proximaDoseAbs, hm);
-  Serial.printf("[DOSE] confirmada via %s. Proxima: %s\n", origem, hm);
+}
+
+bool consumirBotao(BotaoISR& b) {
+  if (!b.pendente) return false;
+  noInterrupts();
+  b.pendente = false;
+  interrupts();
   return true;
 }
 
-void avancarParaProximaDose() {
-  if (proximaDoseAbs > relogioAbs) relogioAbs = proximaDoseAbs;
-  forcarPublicacao = true;
-  Serial.println(F("[TESTE] relogio avancado para a proxima dose"));
-}
-
-void verificarAgenda() {
-  if (!doseDevida && relogioAbs >= proximaDoseAbs) {
-    doseDevida = true;
-    inicioAlarmeMs = millis();
-    forcarPublicacao = true;
-    Serial.println(F("[AGENDA] hora do remedio!"));
-  }
-}
+// --- Temporizadores ---
+unsigned long tDht = 0, tLcd = 0, tMqtt = 0, tReconect = 0;
+bool forcarPublicacao = false;
+bool forcarLcd        = false;
 
 // ============================================================================
-// 4. BUZZER (compativel com Arduino-ESP32 core 2.x e 3.x)
+// 3. BUZZER E FEEDBACK VISUAL
 // ============================================================================
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   void buzzerInit()        { ledcAttach(PIN_BUZZER, 2000, 8); }
@@ -266,19 +185,91 @@ void verificarAgenda() {
   void buzzerTom(int freq) { ledcWriteTone(CANAL_BUZZER, freq); }
 #endif
 
+void mostrarAvisoLCD(const char* l1, const char* l2, unsigned long duracaoMs = 1500) {
+  snprintf(avisoL1, sizeof(avisoL1), "%-16.16s", l1);
+  snprintf(avisoL2, sizeof(avisoL2), "%-16.16s", l2);
+  fimAvisoLcdMs = millis() + duracaoMs;
+  forcarLcd = true;
+}
+
+void tocarBipConfirmacao(unsigned long duracaoMs = 90) {
+  fimBipAckMs = millis() + duracaoMs;
+  buzzerTom(FREQ_ACK);
+  freqAtual = FREQ_ACK;
+}
+
+// ============================================================================
+// 4. TEMPO E AGENDA
+// ============================================================================
+void fmtHMS(uint32_t abs, char* out) {
+  uint32_t s = abs % 86400UL;
+  snprintf(out, 9, "%02lu:%02lu:%02lu", s / 3600, (s % 3600) / 60, s % 60);
+}
+void fmtHM(uint32_t abs, char* out) {
+  uint32_t s = abs % 86400UL;
+  snprintf(out, 6, "%02lu:%02lu", s / 3600, (s % 3600) / 60);
+}
+
+void agendarPara(int hh, int mm) {
+  uint32_t base = (relogioAbs / 86400UL) * 86400UL + hh * 3600UL + mm * 60UL;
+  if (base <= relogioAbs) base += 86400UL;
+  proximaDoseAbs = base;
+  doseDevida = false;
+}
+
+void atualizarRelogio() {
+  unsigned long agora = millis();
+  while (agora - ultimoTick >= 1000UL) {
+    ultimoTick += 1000UL;
+    relogioAbs++;
+    if (relogioAbs / 86400UL != diaAtual) { diaAtual = relogioAbs / 86400UL; dosesHoje = 0; }
+  }
+}
+
+void confirmarDose(const char* origem) {
+  dosesHoje++;
+  proximaDoseAbs += (uint32_t)intervaloHoras * 3600UL;
+  while (proximaDoseAbs <= relogioAbs) proximaDoseAbs += (uint32_t)intervaloHoras * 3600UL;
+  doseDevida = false;
+  forcarPublicacao = true;
+
+  char hm[6], msgL2[17];
+  fmtHM(proximaDoseAbs, hm);
+  snprintf(msgL2, sizeof(msgL2), "Prox dose %s", hm);
+  mostrarAvisoLCD("DOSE CONFIRMADA!", msgL2, 1800);
+  tocarBipConfirmacao(100);
+
+  Serial.printf("[DOSE] confirmada via %s. Proxima: %s\n", origem, hm);
+}
+
+void avancarParaProximaDose() {
+  if (proximaDoseAbs > relogioAbs) relogioAbs = proximaDoseAbs;
+  forcarPublicacao = true;
+  forcarLcd = true;
+  Serial.println(F("[TESTE] relogio avancado para a proxima dose"));
+}
+
+void verificarAgenda() {
+  if (!doseDevida && relogioAbs >= proximaDoseAbs) {
+    doseDevida = true;
+    inicioAlarmeMs = millis();
+    forcarPublicacao = true;
+    forcarLcd = true;
+    Serial.println(F("[AGENDA] hora do remedio!"));
+  }
+}
+
 // ============================================================================
 // 5. SENSORES E PROCESSAMENTO LOCAL
 // ============================================================================
-// Atualiza o historico e calcula a tendencia (variacao nos ultimos ~30 s)
 void atualizarTendencia() {
   histTemp[histIdx] = temperatura;
   histIdx = (histIdx + 1) % JANELA_TENDENCIA;
   if (histN < JANELA_TENDENCIA) histN++;
-  if (histN == JANELA_TENDENCIA) tendencia = temperatura - histTemp[histIdx];  // histIdx = mais antigo
+  if (histN == JANELA_TENDENCIA) tendencia = temperatura - histTemp[histIdx];
   else tendencia = 0.0;
 }
 
-// Le o DHT22, valida (isnan + limites fisicos) e aplica a media movel
 void lerDHT() {
   float t = dht.readTemperature();
   float u = dht.readHumidity();
@@ -298,20 +289,13 @@ void lerDHT() {
   }
 }
 
-// Calibra o LDR no boot: media de 16 leituras = referencia da tampa FECHADA
-void calibrarLDR() {
-  long soma = 0;
-  for (int i = 0; i < 16; i++) soma += analogRead(PIN_LDR);
-  ldrBase = (int)(soma / 16);
-  tampaAberta = false;
-  Serial.printf("[LDR] base calibrada: %d (tampa fechada)\n", ldrBase);
-}
-
-// Detecta o instante de ABERTURA da tampa (borda de subida), com histerese.
-// Funciona nos dois sentidos de variacao do LDR (mais ou menos luz).
 bool detectarAberturaTampa() {
-  int diff = abs(analogRead(PIN_LDR) - ldrBase);
-  bool aberta = tampaAberta ? (diff > LDR_DELTA_FECHAR) : (diff > LDR_DELTA_ABRIR);
+  int v = analogRead(PIN_LDR);
+#if LDR_ALTO_E_LUZ
+  bool aberta = (v > LDR_LIMIAR);
+#else
+  bool aberta = (v < LDR_LIMIAR);
+#endif
   bool evento = (aberta && !tampaAberta);
   if (evento) tAberturaMs = millis();
   tampaAberta = aberta;
@@ -322,18 +306,6 @@ unsigned long luzExpostaSeg() {
   return tampaAberta ? (millis() - tAberturaMs) / 1000UL : 0;
 }
 
-bool botaoPressionado(Botao& b) {
-  bool leitura = digitalRead(b.pino);
-  unsigned long agora = millis();
-  if (leitura != b.ultimaLeitura) { b.tMudanca = agora; b.ultimaLeitura = leitura; }
-  if ((agora - b.tMudanca) > DEBOUNCE_MS && leitura != b.estavel) {
-    b.estavel = leitura;
-    if (b.estavel == LOW) return true;
-  }
-  return false;
-}
-
-// Indice de Conservacao (0-100%): penaliza calor, umidade e exposicao a luz
 int calcularIndice() {
   if (!sensorOk) return 0;
   float penT = (temperatura > 22.0) ? min(60.0f, (temperatura - 22.0f) * 7.5f) : 0;
@@ -366,16 +338,16 @@ void decidirEstado() {
 
   if (latchCritico || atrasoCritico) {
     estado = ESTADO_VERMELHO;
-    alarme = atrasoCritico ? ALARME_CRITICO : ALARME_TERMICO_CRITICO;
+    statusAlarme = atrasoCritico ? "CRITICO" : "TERMICO_CRITICO";
   } else if (doseDevida || latchAlerta || luzExposta || tendenciaAlta) {
     estado = ESTADO_AMARELO;
-    if (doseDevida)         alarme = ALARME_LEMBRETE;
-    else if (latchAlerta)   alarme = ALARME_TERMICO;
-    else if (luzExposta)    alarme = ALARME_LUZ;
-    else                    alarme = ALARME_TENDENCIA;
+    if (doseDevida)         statusAlarme = "LEMBRETE";
+    else if (latchAlerta)   statusAlarme = "TERMICO";
+    else if (luzExposta)    statusAlarme = "LUZ";
+    else                    statusAlarme = "TENDENCIA";
   } else {
     estado = ESTADO_VERDE;
-    alarme = ALARME_OFF;
+    statusAlarme = "OFF";
   }
   indiceConservacao = calcularIndice();
 }
@@ -389,93 +361,60 @@ const char* nomeEstado() {
 }
 
 // ============================================================================
-// 7. ATUADORES
+// 7. ATUADORES E DISPLAY LCD
 // ============================================================================
 void atualizarAtuadores() {
   digitalWrite(PIN_LED_VERDE,    estado == ESTADO_VERDE);
   digitalWrite(PIN_LED_AMARELO,  estado == ESTADO_AMARELO);
   digitalWrite(PIN_LED_VERMELHO, estado == ESTADO_VERMELHO);
 
+  // Mantem o bip curto de confirmacao se estiver ativo
+  if (millis() < fimBipAckMs) return;
+
   int freqAlvo = 0;
-  if (estado == ESTADO_VERMELHO)       freqAlvo = FREQ_CRITICA;                        // continuo
-  else if (estado == ESTADO_AMARELO)   freqAlvo = ((millis() % BIP_PERIODO_MS) < BIP_ON_MS) ? FREQ_LEMBRETE : 0;  // bips
+  if (estado == ESTADO_VERMELHO)       freqAlvo = FREQ_CRITICA;
+  else if (estado == ESTADO_AMARELO)   freqAlvo = ((millis() % BIP_PERIODO_MS) < BIP_ON_MS) ? FREQ_LEMBRETE : 0;
 
   if (freqAlvo != freqAtual) { buzzerTom(freqAlvo); freqAtual = freqAlvo; }
 }
 
-// ============================================================================
-// 8. DISPLAY LCD
-// ============================================================================
 void lcdLinha(uint8_t linha, const char* texto) {
   char buf[17];
-  snprintf(buf, sizeof(buf), "%-16s", texto);
+  snprintf(buf, sizeof(buf), "%-16.16s", texto);
   lcd.setCursor(0, linha);
   lcd.print(buf);
 }
 
-// Mostra o nome do remedio imediatamente (usado quando chega uma nova RECEITA)
-void lcdMostrarNomeAgora() {
-  lcdMostrarNome = true;
-  lcdTFase = millis();
-  lcdScrollTick = 0;
-}
-
 void atualizarLCD() {
+  if (millis() < fimAvisoLcdMs) {
+    lcdLinha(0, avisoL1);
+    lcdLinha(1, avisoL2);
+    return;
+  }
+
   char hms[9], hm[6], l1[24], l2[24];
   fmtHMS(relogioAbs, hms);
   fmtHM(proximaDoseAbs, hm);
 
-  // --- Linha 1: relogio + temperatura ---
   if (sensorOk) snprintf(l1, sizeof(l1), "%s %4.1fC", hms, temperatura);
   else          snprintf(l1, sizeof(l1), "%s --.-C", hms);
-  lcdLinha(0, l1);
 
-  // --- Texto de status (maximo 16 caracteres) ---
   if (estado == ESTADO_VERMELHO)
     snprintf(l2, sizeof(l2), "%s", doseDevida ? "ATRASO CRITICO!" : "PERIGO TERMICO!");
   else if (doseDevida)
     snprintf(l2, sizeof(l2), "TOME O REMEDIO!");
-  else if (alarme == ALARME_LUZ)
-    snprintf(l2, sizeof(l2), "FECHE A TAMPA!");
-  else if (alarme == ALARME_TENDENCIA)
-    snprintf(l2, sizeof(l2), "TEMP. SUBINDO");
   else if (estado == ESTADO_AMARELO)
-    snprintf(l2, sizeof(l2), "CALOR/UMIDADE");
+    snprintf(l2, sizeof(l2), "%s", !strcmp(statusAlarme, "LUZ") ? "FECHE A TAMPA!" :
+                                   !strcmp(statusAlarme, "TENDENCIA") ? "CAIXA ESQUENTANDO" : "CAIXA QUENTE/UMIDA");
   else
     snprintf(l2, sizeof(l2), "Prox %s C%3d%%", hm, indiceConservacao);
 
-  // --- Linha 2: alterna entre o status e o nome do remedio ---
-  unsigned long agora = millis();
-  size_t len = strlen(nomeRemedio);
-
-  if (!lcdMostrarNome) {
-    if (agora - lcdTFase >= LCD_FASE_STATUS_MS) {
-      lcdMostrarNome = true; lcdTFase = agora; lcdScrollTick = 0;
-    }
-  } else if (len <= 16) {
-    if (agora - lcdTFase >= LCD_FASE_NOME_MS) { lcdMostrarNome = false; lcdTFase = agora; }
-  } else {
-    // Nome longo: pausa no inicio, rola 1 coluna por atualizacao, pausa no fim
-    if (lcdScrollTick > (len - 16) + 4) { lcdMostrarNome = false; lcdTFase = agora; }
-  }
-
-  if (lcdMostrarNome) {
-    char janela[17] = {0};
-    size_t off = 0;
-    if (len > 16) {
-      int p = (int)lcdScrollTick - 2;
-      off = (size_t)constrain(p, 0, (int)(len - 16));
-      lcdScrollTick++;
-    }
-    strncpy(janela, nomeRemedio + off, 16);
-    lcdLinha(1, janela);
-  } else {
-    lcdLinha(1, l2);
-  }
+  lcdLinha(0, l1);
+  lcdLinha(1, l2);
 }
 
 // ============================================================================
-// 9. COMANDOS REMOTOS (processados na BORDA, nunca na tarefa de rede)
+// 8. COMANDOS E CADASTRO DE REMEDIOS (MQTT + SERIAL)
 // ============================================================================
 void trimInPlace(char* s) {
   size_t n = strlen(s);
@@ -484,120 +423,240 @@ void trimInPlace(char* s) {
   if (i) memmove(s, s + i, strlen(s + i) + 1);
 }
 
-// RECEITA:Nome|HH:MM|Intervalo
-bool processarReceita(char* corpo) {
-  char* p1 = strchr(corpo, '|');
-  if (!p1) return false;
-  char* p2 = strchr(p1 + 1, '|');
-  if (!p2) return false;
-  *p1 = 0; *p2 = 0;
-  char* nome = corpo; char* hora = p1 + 1; char* inter = p2 + 1;
-  trimInPlace(nome); trimInPlace(hora); trimInPlace(inter);
-
-  int hh, mm, h = atoi(inter);
-  if (strlen(nome) == 0 || sscanf(hora, "%d:%d", &hh, &mm) != 2) return false;
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || h < 1 || h > 24) return false;
-
-  size_t j = 0;   // remove aspas/barras para manter o JSON valido
-  for (size_t i = 0; nome[i] && j < sizeof(nomeRemedio) - 1; i++)
-    if (nome[i] != '"' && nome[i] != '\\') nomeRemedio[j++] = nome[i];
+void definirNomeRemedio(const char* novoNome) {
+  size_t j = 0;
+  for (size_t i = 0; novoNome[i] && j < sizeof(nomeRemedio) - 1; i++) {
+    if (novoNome[i] != '"' && novoNome[i] != '\\') nomeRemedio[j++] = novoNome[i];
+  }
   nomeRemedio[j] = 0;
+}
 
+void aplicarReceitaCompleta(const char* nome, int hh, int mm, int h) {
+  definirNomeRemedio(nome);
   intervaloHoras = (uint8_t)h;
   dosesHoje = 0;
   agendarPara(hh, mm);
-  lcdMostrarNomeAgora();   // o paciente ve o novo nome no display na hora
-  Serial.printf("[RECEITA] %s as %02d:%02d a cada %dh\n", nomeRemedio, hh, mm, h);
+  forcarPublicacao = true;
+
+  char resumo[17];
+  snprintf(resumo, sizeof(resumo), "%02d:%02d a cada %dh", hh, mm, h);
+  mostrarAvisoLCD(nomeRemedio, resumo, 2200);
+  tocarBipConfirmacao(80);
+  Serial.printf("[CADASTRO] Remedio: '%s' | Proxima: %02d:%02d | Intervalo: %dh\n", nomeRemedio, hh, mm, h);
+}
+
+// Aceita separadores: '|' ou ',' ou ';' (Ex: "Amoxicilina 500mg, 08:00, 8")
+bool processarReceitaDelimitada(char* corpo) {
+  char sep = 0;
+  if (strchr(corpo, '|'))      sep = '|';
+  else if (strchr(corpo, ';')) sep = ';';
+  else if (strchr(corpo, ',')) sep = ',';
+  if (!sep) return false;
+
+  char* p1 = strchr(corpo, sep);
+  if (!p1) return false;
+  char* p2 = strchr(p1 + 1, sep);
+  if (!p2) return false;
+
+  *p1 = 0; *p2 = 0;
+  char* nome = corpo;
+  char* hora = p1 + 1;
+  char* inter = p2 + 1;
+  trimInPlace(nome); trimInPlace(hora); trimInPlace(inter);
+
+  int hh = -1, mm = -1, h = atoi(inter);
+  if (strlen(nome) == 0 || sscanf(hora, "%d:%d", &hh, &mm) != 2) return false;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || h < 1 || h > 24) return false;
+
+  aplicarReceitaCompleta(nome, hh, mm, h);
+  return true;
+}
+
+// Suporte a JSON simples: {"remedio":"Dipirona","hora":"08:00","intervalo":8}
+bool processarReceitaJSON(const char* json) {
+  char nome[26] = "";
+  int hh = -1, mm = -1, h = intervaloHoras;
+
+  const char* pRem = strstr(json, "\"remedio\"");
+  if (pRem) {
+    const char* q1 = strchr(pRem + 9, '"');
+    if (q1) {
+      q1++;
+      const char* q2 = strchr(q1, '"');
+      if (q2) {
+        size_t len = min((size_t)(q2 - q1), sizeof(nome) - 1);
+        memcpy(nome, q1, len);
+        nome[len] = 0;
+      }
+    }
+  }
+
+  const char* pHora = strstr(json, "\"hora\"");
+  if (pHora) {
+    const char* q1 = strchr(pHora + 6, '"');
+    if (q1) sscanf(q1 + 1, "%d:%d", &hh, &mm);
+  }
+
+  const char* pInt = strstr(json, "\"intervalo\"");
+  if (pInt) {
+    const char* dp = strchr(pInt + 11, ':');
+    if (dp) h = atoi(dp + 1);
+  }
+
+  if (strlen(nome) == 0 || hh < 0 || hh > 23 || mm < 0 || mm > 59 || h < 1 || h > 24) return false;
+  aplicarReceitaCompleta(nome, hh, mm, h);
   return true;
 }
 
 void imprimirAjuda() {
-  Serial.println(F("Comandos: TOMAR|TOMEI | PROXIMA|ALARME | HH:MM | STATUS | AJUDA"));
-  Serial.println(F("          RECEITA:Nome|HH:MM|Horas  (ex: RECEITA:Amoxicilina 500mg|08:00|8)"));
+  Serial.println(F("\n================ COMANDOS INTEGRAMED v2.1 ================"));
+  Serial.println(F(" [Acoes]     TOMEI | ALARME | AGORA | STATUS | AJUDA"));
+  Serial.println(F(" [Cadastro]  Nome, HH:MM, Horas  (ex: Amoxicilina, 08:00, 8)"));
+  Serial.println(F(" [Avulso]    NOME Dipirona | HORA 14:30 | INT 8 (ou 8H)"));
+  Serial.println(F(" [Perfis]    P1 (Dipirona) | P2 (Amoxicilina) | P3 (Losartana)"));
+  Serial.println(F(" [JSON]      {\"remedio\":\"Dipirona\",\"hora\":\"08:00\",\"intervalo\":8}"));
+  Serial.println(F("==========================================================\n"));
 }
 
-// Interpreta um comando de texto (chamado pelo loop da borda)
-void processarComando(char* msg) {
+void processarComando(const char* entrada, const char* origem) {
+  char msg[128];
+  strncpy(msg, entrada, sizeof(msg) - 1);
+  msg[sizeof(msg) - 1] = 0;
   trimInPlace(msg);
-  Serial.printf("[MQTT] comando: '%s'\n", msg);
+  if (strlen(msg) == 0) return;
 
-  char up[TAM_COMANDO];
+  Serial.printf("[%s] comando recebido: '%s'\n", origem, msg);
+
+  char up[128];
   for (size_t i = 0; i <= strlen(msg); i++) up[i] = toupper((unsigned char)msg[i]);
 
-  int hh, mm;
-  if (!strcmp(up, "TOMAR") || !strcmp(up, "TOMEI")) {
-    confirmarDose("MQTT");
-  } else if (!strcmp(up, "PROXIMA") || !strcmp(up, "ALARME")) {
+  int hh, mm, h;
+
+  // 1. Acoes diretas
+  if (!strcmp(up, "TOMAR") || !strcmp(up, "TOMEI") || !strcmp(up, "OK")) {
+    confirmarDose(origem);
+  } else if (!strcmp(up, "PROXIMA") || !strcmp(up, "ALARME") || !strcmp(up, "TESTE")) {
     avancarParaProximaDose();
+  } else if (!strcmp(up, "AGORA") || !strcmp(up, "JA")) {
+    proximaDoseAbs = relogioAbs + 3;
+    doseDevida = false;
+    forcarPublicacao = true;
+    mostrarAvisoLCD("MODO DEMO", "Alarme em 3s...", 1500);
+    Serial.println(F("[DEMO] Alarme agendado para daqui a 3 segundos!"));
   } else if (!strcmp(up, "STATUS")) {
     forcarPublicacao = true;
-  } else if (!strcmp(up, "AJUDA")) {
+  } else if (!strcmp(up, "AJUDA") || !strcmp(up, "HELP") || !strcmp(up, "?")) {
     imprimirAjuda();
-  } else if (!strncmp(up, "RECEITA:", 8)) {
-    if (processarReceita(msg + 8)) forcarPublicacao = true;
-    else Serial.println(F("[MQTT] RECEITA invalida. Use RECEITA:Nome|HH:MM|Horas"));
-  } else if (strchr(up, ':') && sscanf(up, "%d:%d", &hh, &mm) == 2 &&
-             hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+  }
+  // 2. Perfis rapidos para demonstracao
+  else if (!strcmp(up, "P1")) {
+    aplicarReceitaCompleta("Dipirona 500mg", 8, 0, 8);
+  } else if (!strcmp(up, "P2")) {
+    aplicarReceitaCompleta("Amoxicilina 500", 12, 0, 8);
+  } else if (!strcmp(up, "P3")) {
+    aplicarReceitaCompleta("Losartana 50mg", 7, 0, 12);
+  }
+  // 3. JSON
+  else if (msg[0] == '{') {
+    if (!processarReceitaJSON(msg))
+      Serial.println(F("[ERRO] JSON invalido. Ex: {\"remedio\":\"Dipirona\",\"hora\":\"08:00\",\"intervalo\":8}"));
+  }
+  // 4. Comandos individuais: NOME, HORA, INT
+  else if (!strncmp(up, "NOME ", 5) || !strncmp(up, "NOME:", 5)) {
+    char* novo = msg + 5;
+    trimInPlace(novo);
+    if (strlen(novo) > 0) {
+      definirNomeRemedio(novo);
+      forcarPublicacao = true;
+      mostrarAvisoLCD("REMEDIO ALTERADO", nomeRemedio, 1800);
+      tocarBipConfirmacao(80);
+      Serial.printf("[CADASTRO] Nome alterado para: %s\n", nomeRemedio);
+    }
+  } else if (!strncmp(up, "HORA ", 5) || !strncmp(up, "HORA:", 5)) {
+    if (sscanf(up + 5, "%d:%d", &hh, &mm) == 2 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      agendarPara(hh, mm);
+      forcarPublicacao = true;
+      char l2[17]; snprintf(l2, sizeof(l2), "Agendado %02d:%02d", hh, mm);
+      mostrarAvisoLCD("NOVO HORARIO", l2, 1800);
+      tocarBipConfirmacao(80);
+      Serial.printf("[CADASTRO] Proxima dose agendada para %02d:%02d\n", hh, mm);
+    }
+  } else if (!strncmp(up, "INT ", 4) || !strncmp(up, "INT:", 4) ||
+             !strncmp(up, "INTERVALO ", 10) || !strncmp(up, "INTERVALO:", 10)) {
+    const char* pNum = (up[3] == ' ' || up[3] == ':') ? (up + 4) : (up + 10);
+    h = atoi(pNum);
+    if (h >= 1 && h <= 24) {
+      intervaloHoras = (uint8_t)h;
+      forcarPublicacao = true;
+      char l2[17]; snprintf(l2, sizeof(l2), "A cada %d horas", h);
+      mostrarAvisoLCD("NOVO INTERVALO", l2, 1800);
+      tocarBipConfirmacao(80);
+      Serial.printf("[CADASTRO] Intervalo alterado para %dh\n", h);
+    }
+  }
+  // 5. Atalho de intervalo direto (ex: "8H", "12H")
+  else if (sscanf(up, "%dH", &h) == 1 && h >= 1 && h <= 24 && strlen(up) <= 3) {
+    intervaloHoras = (uint8_t)h;
+    forcarPublicacao = true;
+    char l2[17]; snprintf(l2, sizeof(l2), "A cada %d horas", h);
+    mostrarAvisoLCD("NOVO INTERVALO", l2, 1800);
+    tocarBipConfirmacao(80);
+    Serial.printf("[CADASTRO] Intervalo alterado para %dh\n", h);
+  }
+  // 6. Receita completa (com ou sem prefixo RECEITA: / CAD: / REMEDIO:)
+  else if (!strncmp(up, "RECEITA:", 8) || !strncmp(up, "REMEDIO:", 8)) {
+    if (!processarReceitaDelimitada(msg + 8))
+      Serial.println(F("[ERRO] Formato invalido. Use: Nome, HH:MM, Horas"));
+  } else if (!strncmp(up, "CAD:", 4) || !strncmp(up, "CAD ", 4)) {
+    if (!processarReceitaDelimitada(msg + 4))
+      Serial.println(F("[ERRO] Formato invalido. Use: Nome, HH:MM, Horas"));
+  } else if (strchr(msg, '|') || strchr(msg, ',') || strchr(msg, ';')) {
+    if (!processarReceitaDelimitada(msg))
+      Serial.println(F("[ERRO] Formato invalido. Use: Nome, HH:MM, Horas"));
+  }
+  // 7. Atalho direto de horario (ex: "08:30")
+  else if (strchr(up, ':') && sscanf(up, "%d:%d", &hh, &mm) == 2 &&
+           hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
     agendarPara(hh, mm);
     forcarPublicacao = true;
-    Serial.printf("[MQTT] proxima dose agendada para %02d:%02d\n", hh, mm);
+    char l2[17]; snprintf(l2, sizeof(l2), "Agendado %02d:%02d", hh, mm);
+    mostrarAvisoLCD("NOVO HORARIO", l2, 1800);
+    tocarBipConfirmacao(80);
+    Serial.printf("[CADASTRO] Proxima dose agendada para %02d:%02d\n", hh, mm);
   } else {
-    Serial.println(F("[MQTT] comando desconhecido (envie AJUDA)"));
+    Serial.println(F("[ERRO] Comando desconhecido. Envie AJUDA para ver os exemplos."));
   }
 }
 
-// Callback do PubSubClient (roda na tarefa de rede): apenas ENFILEIRA o comando.
-// Assim nenhuma variavel da borda e alterada fora do nucleo 1 (sem condicao de corrida).
 void callbackMQTT(char* topic, byte* payload, unsigned int length) {
-  char msg[TAM_COMANDO];
-  memset(msg, 0, sizeof(msg));
+  char msg[128];
   if (length >= sizeof(msg)) length = sizeof(msg) - 1;
   memcpy(msg, payload, length);
-  xQueueSend(filaComandos, msg, 0);   // se a fila estiver cheia, descarta
+  msg[length] = 0;
+  processarComando(msg, "MQTT");
 }
 
-// Esvazia a fila de comandos (chamado a cada ciclo do loop)
-void processarFilaComandos() {
-  char msg[TAM_COMANDO];
-  while (xQueueReceive(filaComandos, msg, 0) == pdTRUE) processarComando(msg);
-}
-
-// ============================================================================
-// 10. TELEMETRIA (montada na borda, publicada pela tarefa de rede)
-// ============================================================================
-void montarJson(char* json, size_t n) {
-  char hms[9], hm[6], tStr[12], uStr[12];
-  fmtHMS(relogioAbs, hms);
-  fmtHM(proximaDoseAbs, hm);
-  if (sensorOk) { snprintf(tStr, sizeof(tStr), "%.1f", temperatura); snprintf(uStr, sizeof(uStr), "%.1f", umidade); }
-  else          { strcpy(tStr, "null"); strcpy(uStr, "null"); }
-
-  snprintf(json, n,
-    "{\"id\":\"%s\",\"relogio\":\"%s\",\"proxima_dose\":\"%s\",\"posologia\":\"%u/%uh\","
-    "\"remedio\":\"%s\",\"estado\":\"%s\",\"alarme\":\"%s\",\"tampa\":\"%s\","
-    "\"doses_hoje\":%u,\"temperatura\":%s,\"umidade\":%s,"
-    "\"indice_conservacao\":%d,\"tendencia\":%.1f}",
-    DEVICE_ID, hms, hm, intervaloHoras, intervaloHoras, nomeRemedio, nomeEstado(),
-    nomeAlarme(alarme), tampaAberta ? "ABERTA" : "FECHADA", dosesHoje, tStr, uStr,
-    indiceConservacao, tendencia);
-}
-
-// Entrega o JSON para a tarefa de rede (nao bloqueia: espera no maximo 10 ms)
-void enviarParaRede() {
-  char json[TAM_JSON];
-  montarJson(json, sizeof(json));
-  if (xSemaphoreTake(mutexJson, pdMS_TO_TICKS(10)) == pdTRUE) {
-    strlcpy(jsonPendente, json, sizeof(jsonPendente));
-    jsonNovo = true;
-    xSemaphoreGive(mutexJson);
+void lerComandosSerial() {
+  static char buf[128];
+  static size_t idx = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (idx > 0) {
+        buf[idx] = 0;
+        processarComando(buf, "SERIAL");
+        idx = 0;
+      }
+    } else if (idx < sizeof(buf) - 1) {
+      buf[idx++] = c;
+    }
   }
 }
 
 // ============================================================================
-// 11. TAREFA DE REDE (nucleo 0): Wi-Fi + MQTT
+// 9. CONECTIVIDADE
 // ============================================================================
 void manterConexoes() {
-  static unsigned long tReconect = 0;
   unsigned long agora = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -615,45 +674,41 @@ void manterConexoes() {
     char cid[40];
     snprintf(cid, sizeof(cid), "%s-%04X", DEVICE_ID, (uint16_t)esp_random());
     Serial.print(F("[MQTT] conectando... "));
-    // Last Will: se cair sem avisar, o broker publica "offline" (retido)
     if (mqtt.connect(cid, NULL, NULL, TOPICO_STATUS, 1, true, "offline")) {
       mqtt.subscribe(TOPICO_SUB);
       mqtt.publish(TOPICO_STATUS, "online", true);
       Serial.println(F("OK"));
-      mqttReconectou = true;
+      forcarPublicacao = true;
     } else {
       Serial.printf("falhou rc=%d\n", mqtt.state());
     }
   }
 }
 
-// Esta tarefa roda isolada da borda: mesmo que o connect() demore, os LEDs,
-// o buzzer, o LCD e os botoes continuam respondendo no nucleo 1.
-// (vTaskDelay aqui apenas cede CPU a tarefa; o loop da borda nao usa delay.)
-void tarefaRede(void* param) {
-  char json[TAM_JSON];
-  for (;;) {
-    manterConexoes();
-    if (mqtt.connected()) {
-      mqtt.loop();
-      if (jsonNovo) {
-        bool tem = false;
-        if (xSemaphoreTake(mutexJson, pdMS_TO_TICKS(20)) == pdTRUE) {
-          if (jsonNovo) { strlcpy(json, jsonPendente, sizeof(json)); jsonNovo = false; tem = true; }
-          xSemaphoreGive(mutexJson);
-        }
-        if (tem) {
-          if (mqtt.publish(TOPICO_PUB, json)) Serial.printf("[MQTT] pub: %s\n", json);
-          else Serial.println(F("[MQTT] falha ao publicar"));
-        }
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
+void publicarTelemetria() {
+  if (!mqtt.connected()) return;
+
+  char hms[9], hm[6], tStr[12], uStr[12], json[520];
+  fmtHMS(relogioAbs, hms);
+  fmtHM(proximaDoseAbs, hm);
+  if (sensorOk) { snprintf(tStr, sizeof(tStr), "%.1f", temperatura); snprintf(uStr, sizeof(uStr), "%.1f", umidade); }
+  else          { strcpy(tStr, "null"); strcpy(uStr, "null"); }
+
+  snprintf(json, sizeof(json),
+    "{\"id\":\"%s\",\"relogio\":\"%s\",\"proxima_dose\":\"%s\",\"posologia\":\"%u/%uh\","
+    "\"remedio\":\"%s\",\"estado\":\"%s\",\"alarme\":\"%s\",\"tampa\":\"%s\","
+    "\"doses_hoje\":%u,\"temperatura\":%s,\"umidade\":%s,"
+    "\"indice_conservacao\":%d,\"tendencia\":%.1f}",
+    DEVICE_ID, hms, hm, intervaloHoras, intervaloHoras, nomeRemedio, nomeEstado(),
+    statusAlarme, tampaAberta ? "ABERTA" : "FECHADA", dosesHoje, tStr, uStr,
+    indiceConservacao, tendencia);
+
+  if (mqtt.publish(TOPICO_PUB, json)) Serial.printf("[MQTT] pub: %s\n", json);
+  else Serial.println(F("[MQTT] falha ao publicar"));
 }
 
 // ============================================================================
-// 12. SETUP E LOOP (BORDA - nucleo 1)
+// 10. SETUP E LOOP
 // ============================================================================
 void setup() {
   Serial.begin(115200);
@@ -664,6 +719,11 @@ void setup() {
   pinMode(PIN_BTN_TOMEI, INPUT_PULLUP);
   pinMode(PIN_BTN_TESTE, INPUT_PULLUP);
   pinMode(PIN_LDR, INPUT);
+
+  // Interrupcoes de hardware para resposta instantanea dos botoes
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_TOMEI), isrBtnTomei, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_TESTE), isrBtnTeste, FALLING);
+
   buzzerInit();
   buzzerTom(0);
 
@@ -671,66 +731,67 @@ void setup() {
   Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
-  lcdLinha(0, "IntegraMed");
+  lcdLinha(0, "IntegraMed v2.1");
   lcdLinha(1, "Iniciando...");
 
-  calibrarLDR();
-
-  // --- Rede em tarefa propria (nucleo 0) ---
-  filaComandos = xQueueCreate(4, TAM_COMANDO);
-  mutexJson    = xSemaphoreCreateMutex();
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
   mqtt.setCallback(callbackMQTT);
   mqtt.setBufferSize(640);
   mqtt.setSocketTimeout(2);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
-  xTaskCreatePinnedToCore(tarefaRede, "rede", 8192, NULL, 1, NULL, 0);
 
   ultimoTick = millis();
   diaAtual = relogioAbs / 86400UL;
   lerDHT();
-  Serial.println(F("IntegraMed pronto. Envie AJUDA no topico de comandos."));
+  Serial.println(F("IntegraMed v2.1 pronto. Digite ou envie AJUDA via MQTT."));
   imprimirAjuda();
 }
 
 void loop() {
   unsigned long agora = millis();
   static EstadoBorda estadoAnterior = ESTADO_VERDE;
-  static AlarmeTipo  alarmeAnterior = ALARME_OFF;
+  static const char* alarmeAnterior = "OFF";
 
-  // --- Comandos remotos recebidos pela tarefa de rede ---
-  processarFilaComandos();
-  if (mqttReconectou) { mqttReconectou = false; forcarPublicacao = true; }
+  // --- 1. Entradas imediatas (Botoes via ISR + Comandos Serial) ---
+  if (consumirBotao(btnTomei)) confirmarDose("botao verde");
+  if (consumirBotao(btnTeste)) avancarParaProximaDose();
+  lerComandosSerial();
 
-  // --- Relogio e sensores ---
+  // --- 2. Rede (MQTT) ---
+  manterConexoes();
+  if (mqtt.connected()) mqtt.loop();
+
+  // --- 3. Relogio e sensores ---
   atualizarRelogio();
   if (agora - tDht >= PERIODO_DHT_MS) { tDht = agora; lerDHT(); }
 
-  // --- Entradas do paciente ---
   bool abriuTampa = detectarAberturaTampa();
-  if (botaoPressionado(btnTomei)) confirmarDose("botao verde");
-  if (botaoPressionado(btnTeste)) avancarParaProximaDose();
-  if (abriuTampa && doseDevida)   confirmarDose("tampa (LDR)");
+  if (abriuTampa && doseDevida) confirmarDose("tampa (LDR)");
 
-  // --- Processamento local, decisao e atuacao ---
+  // --- 4. Processamento local, decisao e atuacao ---
   verificarAgenda();
   decidirEstado();
   atualizarAtuadores();
-  if (agora - tLcd >= PERIODO_LCD_MS) { tLcd = agora; atualizarLCD(); }
 
-  // --- Publicacao por excecao: muda o estado/alarme -> publica na hora ---
-  if (estado != estadoAnterior || alarme != alarmeAnterior) {
-    estadoAnterior = estado;
-    alarmeAnterior = alarme;
-    forcarPublicacao = true;
-    Serial.printf("[ESTADO] %s (%s)\n", nomeEstado(), nomeAlarme(alarme));
+  if (forcarLcd || agora - tLcd >= PERIODO_LCD_MS) {
+    tLcd = agora;
+    forcarLcd = false;
+    atualizarLCD();
   }
 
-  // --- Telemetria periodica (3 s) ou imediata por evento ---
+  // --- 5. Publicacao por excecao ou periodica ---
+  if (estado != estadoAnterior || statusAlarme != alarmeAnterior) {
+    estadoAnterior = estado;
+    alarmeAnterior = statusAlarme;
+    forcarPublicacao = true;
+    Serial.printf("[ESTADO] %s (%s)\n", nomeEstado(), statusAlarme);
+  }
+
   if (forcarPublicacao || agora - tMqtt >= PERIODO_MQTT_MS) {
     tMqtt = agora;
     forcarPublicacao = false;
-    enviarParaRede();
+    publicarTelemetria();
   }
 }
